@@ -903,6 +903,8 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 ev_io_start(EV_A_ & remote->send_ctx->io);
             }
         } else {
+            ev_io_stop(EV_A_ & server_recv_ctx->io);
+
             query_t *query = ss_malloc(sizeof(query_t));
             memset(query, 0, sizeof(query_t));
             query->server = server;
@@ -910,18 +912,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             snprintf(query->hostname, 256, "%s", host);
 
             server->stage = STAGE_RESOLVE;
-            struct resolv_query *q = resolv_start(host, port,
-                                                  resolv_cb, resolv_free_cb, query);
-
-            if (q == NULL) {
-                if (query != NULL)
-                    ss_free(query);
-                server->query = NULL;
-                close_and_free_server(EV_A_ server);
-                return;
-            }
-
-            ev_io_stop(EV_A_ & server_recv_ctx->io);
+            resolv_start(host, port, resolv_cb, resolv_free_cb, query);
         }
 
         return;
@@ -1845,6 +1836,11 @@ main(int argc, char **argv)
                 host = "127.0.0.1";
             }
 
+            if (host && strcmp(host, ":") > 0)
+                LOGI("tcp server listening at [%s]:%s", host, server_port);
+            else
+                LOGI("tcp server listening at %s:%s", host ? host : "0.0.0.0", server_port);
+
             // Bind to port
             int listenfd;
             listenfd = create_and_bind(host, server_port, mptcp);
@@ -1867,11 +1863,6 @@ main(int argc, char **argv)
             ev_io_init(&listen_ctx->io, accept_cb, listenfd, EV_READ);
             ev_io_start(loop, &listen_ctx->io);
 
-            if (host && strcmp(host, ":") > 0)
-                LOGI("tcp server listening at [%s]:%s", host, server_port);
-            else
-                LOGI("tcp server listening at %s:%s", host ? host : "0.0.0.0", server_port);
-
             if (plugin != NULL)
                 break;
         }
@@ -1884,12 +1875,12 @@ main(int argc, char **argv)
             if (plugin != NULL) {
                 port = plugin_port;
             }
-            // Setup UDP
-            init_udprelay(host, port, mtu, crypto, atoi(timeout), iface);
             if (host && strcmp(host, ":") > 0)
                 LOGI("udp server listening at [%s]:%s", host, port);
             else
                 LOGI("udp server listening at %s:%s", host ? host : "0.0.0.0", port);
+            // Setup UDP
+            init_udprelay(host, port, mtu, crypto, atoi(timeout), iface);
         }
     }
 

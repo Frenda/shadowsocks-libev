@@ -253,7 +253,6 @@ delayed_connect_cb(EV_P_ ev_timer *watcher, int revents)
     server_t *server = cork_container_of(watcher, server_t,
                                          delayed_connect_watcher);
 
-    server->stage = STAGE_WAIT;
     server_recv_cb(EV_A_ & server->recv_ctx->io, revents);
 }
 
@@ -266,13 +265,15 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     buffer_t *buf;
     ssize_t r;
 
+    ev_timer_stop(EV_A_ & server->delayed_connect_watcher);
+
     if (remote == NULL) {
         buf = server->buf;
     } else {
         buf = remote->buf;
     }
 
-    if (server->stage != STAGE_WAIT) {
+    if (revents != EV_TIMER) {
         r = recv(server->fd, buf->data + buf->len, BUF_SIZE - buf->len, 0);
 
         if (r == 0) {
@@ -294,8 +295,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             }
         }
         buf->len += r;
-    } else {
-        server->stage = STAGE_STREAM;
     }
 
     while (1) {
@@ -306,8 +305,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 close_and_free_server(EV_A_ server);
                 return;
             }
-
-            ev_timer_stop(EV_A_ & server->delayed_connect_watcher);
 
             // insert shadowsocks header
             if (!remote->direct) {
@@ -498,7 +495,9 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 
             buf->len = 0;
             return;
-        } else if (server->stage == STAGE_HANDSHAKE || server->stage == STAGE_PARSE) {
+        } else if (server->stage == STAGE_HANDSHAKE ||
+                   server->stage == STAGE_PARSE ||
+                   server->stage == STAGE_SNI) {
             struct socks5_request *request = (struct socks5_request *)buf->data;
             size_t request_len             = sizeof(struct socks5_request);
             struct sockaddr_in sock_addr;
@@ -568,9 +567,9 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                     // Wait until client closes the connection
                     return;
                 }
-            }
 
-            server->stage = STAGE_PARSE;
+                server->stage = STAGE_PARSE;
+            }
 
             char host[257], ip[INET6_ADDRSTRLEN], port[16];
 
@@ -638,39 +637,28 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 
             size_t abuf_len  = abuf->len;
             int sni_detected = 0;
+            int ret          = 0;
+
+            char *hostname;
+            uint16_t dst_port = ntohs(*(uint16_t *)(abuf->data + abuf->len - 2));
 
             if (atyp == 1 || atyp == 4) {
-                char *hostname;
-                uint16_t p = ntohs(*(uint16_t *)(abuf->data + abuf->len - 2));
-                int ret    = 0;
-                if (p == http_protocol->default_port)
+                if (dst_port == http_protocol->default_port)
                     ret = http_protocol->parse_packet(buf->data + 3 + abuf->len,
                                                       buf->len - 3 - abuf->len, &hostname);
-                else if (p == tls_protocol->default_port)
+                else if (dst_port == tls_protocol->default_port)
                     ret = tls_protocol->parse_packet(buf->data + 3 + abuf->len,
                                                      buf->len - 3 - abuf->len, &hostname);
-                if (ret == -1 && buf->len < BUF_SIZE) {
+                if (ret == -1 && buf->len < BUF_SIZE && server->stage != STAGE_SNI) {
+                    server->stage = STAGE_SNI;
+                    ev_timer_start(EV_A_ & server->delayed_connect_watcher);
                     return;
                 } else if (ret > 0) {
                     sni_detected = 1;
-
-#ifndef __ANDROID__
-                    // Reconstruct address buffer
-                    abuf->len               = 0;
-                    abuf->data[abuf->len++] = 3;
-                    abuf->data[abuf->len++] = ret;
-                    memcpy(abuf->data + abuf->len, hostname, ret);
-                    abuf->len += ret;
-                    p          = htons(p);
-                    memcpy(abuf->data + abuf->len, &p, 2);
-                    abuf->len += 2;
-#endif
-
                     if (acl || verbose) {
                         memcpy(host, hostname, ret);
                         host[ret] = '\0';
                     }
-
                     ss_free(hostname);
                 }
             }
@@ -696,12 +684,15 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 && !(vpn && strcmp(port, "53") == 0)
 #endif
                 ) {
-                int host_match = acl_match_host(host);
                 int bypass     = 0;
                 int resolved   = 0;
                 struct sockaddr_storage storage;
                 memset(&storage, 0, sizeof(struct sockaddr_storage));
                 int err;
+
+                int host_match = 0;
+                if (sni_detected || atyp == 3)
+                    host_match = acl_match_host(host);
 
                 if (host_match > 0)
                     bypass = 1;                 // bypass hostnames in black list
@@ -769,7 +760,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 }
             }
 
-            // Not match ACL
+            // Not bypass
             if (remote == NULL) {
                 remote = create_remote(server->listener, NULL);
             }
@@ -798,7 +789,11 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             server->remote = remote;
             remote->server = server;
 
-            ev_timer_start(EV_A_ & server->delayed_connect_watcher);
+            if (buf->len > 0 || sni_detected) {
+                continue;
+            } else {
+                ev_timer_start(EV_A_ & server->delayed_connect_watcher);
+            }
 
             return;
         }
@@ -1629,6 +1624,11 @@ main(int argc, char **argv)
     ev_signal_init(&sigchld_watcher, signal_cb, SIGCHLD);
     ev_signal_start(EV_DEFAULT, &sigchld_watcher);
 
+    if (strcmp(local_addr, ":") > 0)
+        LOGI("listening at [%s]:%s", local_addr, local_port);
+    else
+        LOGI("listening at %s:%s", local_addr, local_port);
+
     struct ev_loop *loop = EV_DEFAULT;
 
     if (mode != UDP_ONLY) {
@@ -1673,11 +1673,6 @@ main(int argc, char **argv)
         LOGI("listening through launchd");
     else
 #endif
-
-    if (strcmp(local_addr, ":") > 0)
-        LOGI("listening at [%s]:%s", local_addr, local_port);
-    else
-        LOGI("listening at %s:%s", local_addr, local_port);
 
     // setuid
     if (user != NULL && !run_as(user)) {
@@ -1795,6 +1790,11 @@ _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udat
     listen_ctx.iface          = NULL;
     listen_ctx.mptcp          = mptcp;
 
+    if (strcmp(local_addr, ":") > 0)
+        LOGI("listening at [%s]:%s", local_addr, local_port_str);
+    else
+        LOGI("listening at %s:%s", local_addr, local_port_str);
+
     if (mode != UDP_ONLY) {
         // Setup socket
         int listenfd;
@@ -1822,11 +1822,6 @@ _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udat
         udp_fd = init_udprelay(local_addr, local_port_str, addr,
                                get_sockaddr_len(addr), mtu, crypto, timeout, NULL);
     }
-
-    if (strcmp(local_addr, ":") > 0)
-        LOGI("listening at [%s]:%s", local_addr, local_port_str);
-    else
-        LOGI("listening at %s:%s", local_addr, local_port_str);
 
     // Init connections
     cork_dllist_init(&connections);
