@@ -33,6 +33,7 @@
 
 #include <stdint.h>
 #include <sodium.h>
+#include <mbedtls/version.h>
 #include <mbedtls/md5.h>
 
 #include "base64.h"
@@ -102,7 +103,12 @@ crypto_md5(const unsigned char *d, size_t n, unsigned char *md)
     if (md == NULL) {
         md = m;
     }
+#if MBEDTLS_VERSION_NUMBER >= 0x02070000
+    if (mbedtls_md5_ret(d, n, md) != 0)
+        FATAL("Failed to calculate MD5");
+#else
     mbedtls_md5(d, n, md);
+#endif
     return md;
 }
 
