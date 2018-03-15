@@ -33,12 +33,12 @@
 #include <strings.h>
 #include <unistd.h>
 #include <getopt.h>
-
+#ifndef __MINGW32__
 #include <errno.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
-
+#endif
 #ifdef LIB_ONLY
 #include "shadowsocks.h"
 #endif
@@ -59,6 +59,7 @@
 #include "tls.h"
 #include "plugin.h"
 #include "local.h"
+#include "winsock.h"
 
 #ifndef LIB_ONLY
 #ifdef __APPLE__
@@ -101,11 +102,21 @@ static int ipv6first = 0;
 static int fast_open = 0;
 static int no_delay  = 0;
 static int udp_fd    = 0;
+static int ret_val   = 0;
 
 static struct ev_signal sigint_watcher;
 static struct ev_signal sigterm_watcher;
+#ifndef __MINGW32__
 static struct ev_signal sigchld_watcher;
 static struct ev_signal sigusr1_watcher;
+#else
+static struct plugin_watcher_t {
+    ev_io io;
+    SOCKET fd;
+    uint16_t port;
+    int valid;
+} plugin_watcher;
+#endif
 
 #ifdef HAVE_SETRLIMIT
 #ifndef LIB_ONLY
@@ -119,6 +130,9 @@ static void remote_recv_cb(EV_P_ ev_io *w, int revents);
 static void remote_send_cb(EV_P_ ev_io *w, int revents);
 static void accept_cb(EV_P_ ev_io *w, int revents);
 static void signal_cb(EV_P_ ev_signal *w, int revents);
+#if defined(__MINGW32__) && !defined(LIB_ONLY)
+static void plugin_watcher_cb(EV_P_ ev_io *w, int revents);
+#endif
 
 static int create_and_bind(const char *addr, const char *port);
 #ifdef HAVE_LAUNCHD
@@ -135,6 +149,7 @@ static server_t *new_server(int fd);
 
 static struct cork_dllist connections;
 
+#ifndef __MINGW32__
 int
 setnonblocking(int fd)
 {
@@ -144,6 +159,7 @@ setnonblocking(int fd)
     }
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
+#endif
 
 int
 create_and_bind(const char *addr, const char *port)
@@ -366,11 +382,56 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                     ev_io_start(EV_A_ & remote->send_ctx->io);
                     ev_timer_start(EV_A_ & remote->send_ctx->watcher);
                 } else {
-                    int s = -1;
 #if defined(MSG_FASTOPEN) && !defined(TCP_FASTOPEN_CONNECT)
+                    int s = -1;
                     s = sendto(remote->fd, remote->buf->data, remote->buf->len, MSG_FASTOPEN,
                                    (struct sockaddr *)&(remote->addr), remote->addr_len);
+#elif defined(TCP_FASTOPEN_WINSOCK)
+                    DWORD s = -1;
+                    DWORD err = 0;
+                    do {
+                        int optval = 1;
+                        // Set fast open option
+                        if (setsockopt(remote->fd, IPPROTO_TCP, TCP_FASTOPEN,
+                                       &optval, sizeof(optval)) != 0) {
+                            ERROR("setsockopt");
+                            break;
+                        }
+                        // Load ConnectEx function
+                        LPFN_CONNECTEX ConnectEx = winsock_getconnectex();
+                        if (ConnectEx == NULL) {
+                            LOGE("Cannot load ConnectEx() function");
+                            err = WSAENOPROTOOPT;
+                            break;
+                        }
+                        // ConnectEx requires a bound socket
+                        if (winsock_dummybind(remote->fd,
+                                              (struct sockaddr *)&(remote->addr)) != 0) {
+                            ERROR("bind");
+                            break;
+                        }
+                        // Call ConnectEx to send data
+                        memset(&remote->olap, 0, sizeof(remote->olap));
+                        remote->connect_ex_done = 0;
+                        if (ConnectEx(remote->fd, (const struct sockaddr *)&(remote->addr),
+                                      remote->addr_len, remote->buf->data, remote->buf->len,
+                                      &s, &remote->olap)) {
+                            remote->connect_ex_done = 1;
+                            break;
+                        };
+                        // XXX: ConnectEx pending, check later in remote_send
+                        if (WSAGetLastError() == ERROR_IO_PENDING) {
+                            err = CONNECT_IN_PROGRESS;
+                            break;
+                        }
+                        ERROR("ConnectEx");
+                    } while(0);
+                    // Set error number
+                    if (err) {
+                        SetLastError(err);
+                    }
 #else
+                    int s = -1;
 #if defined(CONNECT_DATA_IDEMPOTENT)
                     ((struct sockaddr_in *)&(remote->addr))->sin_len = sizeof(struct sockaddr_in);
                     sa_endpoints_t endpoints;
@@ -953,6 +1014,37 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
     server_t *server              = remote->server;
 
     if (!remote_send_ctx->connected) {
+#ifdef TCP_FASTOPEN_WINSOCK
+        if (fast_open) {
+            // Check if ConnectEx is done
+            if (!remote->connect_ex_done) {
+                DWORD numBytes;
+                DWORD flags;
+                // Non-blocking way to fetch ConnectEx result
+                if (WSAGetOverlappedResult(remote->fd, &remote->olap,
+                                           &numBytes, FALSE, &flags)) {
+                    remote->buf->len -= numBytes;
+                    remote->buf->idx  = numBytes;
+                    remote->connect_ex_done = 1;
+                } else if (WSAGetLastError() == WSA_IO_INCOMPLETE) {
+                    // XXX: ConnectEx still not connected, wait for next time
+                    return;
+                } else {
+                    ERROR("WSAGetOverlappedResult");
+                    // not connected
+                    close_and_free_remote(EV_A_ remote);
+                    close_and_free_server(EV_A_ server);
+                    return;
+                };
+            }
+
+            // Make getpeername work
+            if (setsockopt(remote->fd, SOL_SOCKET,
+                           SO_UPDATE_CONNECT_CONTEXT, NULL, 0) != 0) {
+                ERROR("setsockopt");
+            }
+        }
+#endif
         struct sockaddr_storage addr;
         socklen_t len = sizeof addr;
         int r         = getpeername(remote->fd, (struct sockaddr *)&addr, &len);
@@ -1213,23 +1305,52 @@ signal_cb(EV_P_ ev_signal *w, int revents)
 {
     if (revents & EV_SIGNAL) {
         switch (w->signum) {
+#ifndef __MINGW32__
         case SIGCHLD:
-            if (!is_plugin_running())
+            if (!is_plugin_running()) {
                 LOGE("plugin service exit unexpectedly");
+                ret_val = -1;
+            }
             else
                 return;
         case SIGUSR1:
+#endif
         case SIGINT:
         case SIGTERM:
             ev_signal_stop(EV_DEFAULT, &sigint_watcher);
             ev_signal_stop(EV_DEFAULT, &sigterm_watcher);
+#ifndef __MINGW32__
             ev_signal_stop(EV_DEFAULT, &sigchld_watcher);
             ev_signal_stop(EV_DEFAULT, &sigusr1_watcher);
+#else
+            ev_io_stop(EV_DEFAULT, &plugin_watcher.io);
+#endif
             keep_resolving = 0;
             ev_unloop(EV_A_ EVUNLOOP_ALL);
         }
     }
 }
+
+#if defined(__MINGW32__) && !defined(LIB_ONLY)
+static void
+plugin_watcher_cb(EV_P_ ev_io *w, int revents)
+{
+    char buf[1];
+    SOCKET fd = accept(plugin_watcher.fd, NULL, NULL);
+    if (fd == INVALID_SOCKET) {
+        return;
+    }
+    recv(fd, buf, 1, 0);
+    closesocket(fd);
+    LOGE("plugin service exit unexpectedly");
+    ret_val = -1;
+    ev_signal_stop(EV_DEFAULT, &sigint_watcher);
+    ev_signal_stop(EV_DEFAULT, &sigterm_watcher);
+    ev_io_stop(EV_DEFAULT, &plugin_watcher.io);
+    keep_resolving = 0;
+    ev_unloop(EV_A_ EVUNLOOP_ALL);
+}
+#endif
 
 void
 accept_cb(EV_P_ ev_io *w, int revents)
@@ -1501,6 +1622,10 @@ main(int argc, char **argv)
         exit(EXIT_FAILURE);
     }
 
+#ifdef __MINGW32__
+    winsock_init();
+#endif
+
     if (plugin != NULL) {
         uint16_t port = get_local_port();
         if (port == 0) {
@@ -1509,6 +1634,14 @@ main(int argc, char **argv)
         snprintf(tmp_port, 8, "%d", port);
         plugin_host = "127.0.0.1";
         plugin_port = tmp_port;
+
+#ifdef __MINGW32__
+        memset(&plugin_watcher, 0, sizeof(plugin_watcher));
+        plugin_watcher.port = get_local_port();
+        if (plugin_watcher.port == 0) {
+            LOGE("failed to assign a control port for plugin");
+        }
+#endif
 
         LOGI("plugin \"%s\" enabled", plugin);
     }
@@ -1560,6 +1693,40 @@ main(int argc, char **argv)
         LOGI("resolving hostname to IPv6 address first");
     }
 
+#ifdef __MINGW32__
+    // Listen on plugin control port
+    if (plugin != NULL && plugin_watcher.port != 0) {
+        SOCKET fd;
+        fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (fd != INVALID_SOCKET) {
+            plugin_watcher.valid = 0;
+            do {
+                struct sockaddr_in addr;
+                memset(&addr, 0, sizeof(addr));
+                addr.sin_family = AF_INET;
+                addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                addr.sin_port = htons(plugin_watcher.port);
+                if (bind(fd, (struct sockaddr *)&addr, sizeof(addr))) {
+                    LOGE("failed to bind plugin control port");
+                    break;
+                }
+                if (listen(fd, 1)) {
+                    LOGE("failed to listen on plugin control port");
+                    break;
+                }
+                plugin_watcher.fd = fd;
+                ev_io_init(&plugin_watcher.io, plugin_watcher_cb, fd, EV_READ);
+                ev_io_start(EV_DEFAULT, &plugin_watcher.io);
+                plugin_watcher.valid = 1;
+            } while (0);
+            if (!plugin_watcher.valid) {
+                closesocket(fd);
+                plugin_watcher.port = 0;
+            }
+        }
+    }
+#endif
+
     if (plugin != NULL) {
         int len          = 0;
         size_t buf_size  = 256 * remote_num;
@@ -1572,15 +1739,22 @@ main(int argc, char **argv)
             len = strlen(remote_str);
         }
         int err = start_plugin(plugin, plugin_opts, remote_str,
-                               remote_port, plugin_host, plugin_port, MODE_CLIENT);
+                               remote_port, plugin_host, plugin_port,
+#ifdef __MINGW32__
+                               plugin_watcher.port,
+#endif
+                               MODE_CLIENT);
         if (err) {
+            ERROR("start_plugin");
             FATAL("failed to start the plugin");
         }
     }
 
+#ifndef __MINGW32__
     // ignore SIGPIPE
     signal(SIGPIPE, SIG_IGN);
     signal(SIGABRT, SIG_IGN);
+#endif
 
     // Setup keys
     LOGI("initializing ciphers... %s", method);
@@ -1621,8 +1795,10 @@ main(int argc, char **argv)
     ev_signal_init(&sigterm_watcher, signal_cb, SIGTERM);
     ev_signal_start(EV_DEFAULT, &sigint_watcher);
     ev_signal_start(EV_DEFAULT, &sigterm_watcher);
+#ifndef __MINGW32__
     ev_signal_init(&sigchld_watcher, signal_cb, SIGCHLD);
     ev_signal_start(EV_DEFAULT, &sigchld_watcher);
+#endif
 
     if (strcmp(local_addr, ":") > 0)
         LOGI("listening at [%s]:%s", local_addr, local_port);
@@ -1674,6 +1850,7 @@ main(int argc, char **argv)
     else
 #endif
 
+#ifndef __MINGW32__
     // setuid
     if (user != NULL && !run_as(user)) {
         FATAL("failed to switch user");
@@ -1682,6 +1859,7 @@ main(int argc, char **argv)
     if (geteuid() == 0) {
         LOGI("running from root user");
     }
+#endif
 
     // Init connections
     cork_dllist_init(&connections);
@@ -1711,7 +1889,11 @@ main(int argc, char **argv)
         free_udprelay();
     }
 
-    return 0;
+#ifdef __MINGW32__
+    winsock_cleanup();
+#endif
+
+    return ret_val;
 }
 
 #else
@@ -1743,6 +1925,10 @@ _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udat
     sprintf(local_port_str, "%d", local_port);
     sprintf(remote_port_str, "%d", remote_port);
 
+#ifdef __MINGW32__
+    winsock_init();
+#endif
+
     USE_LOGFILE(log);
 
     if (profile.acl != NULL) {
@@ -1753,18 +1939,22 @@ _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udat
         local_addr = "127.0.0.1";
     }
 
+#ifndef __MINGW32__
     // ignore SIGPIPE
     signal(SIGPIPE, SIG_IGN);
     signal(SIGABRT, SIG_IGN);
+#endif
 
     ev_signal_init(&sigint_watcher, signal_cb, SIGINT);
     ev_signal_init(&sigterm_watcher, signal_cb, SIGTERM);
     ev_signal_start(EV_DEFAULT, &sigint_watcher);
     ev_signal_start(EV_DEFAULT, &sigterm_watcher);
+#ifndef __MINGW32__
     ev_signal_init(&sigusr1_watcher, signal_cb, SIGUSR1);
     ev_signal_init(&sigchld_watcher, signal_cb, SIGCHLD);
     ev_signal_start(EV_DEFAULT, &sigusr1_watcher);
     ev_signal_start(EV_DEFAULT, &sigchld_watcher);
+#endif
 
     // Setup keys
     LOGI("initializing ciphers... %s", method);
@@ -1848,7 +2038,15 @@ _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udat
         free_udprelay();
     }
 
-    return 0;
+#ifdef __MINGW32__
+    if (plugin_watcher.valid) {
+        closesocket(plugin_watcher.fd);
+    }
+
+    winsock_cleanup();
+#endif
+
+    return ret_val;
 }
 
 int
