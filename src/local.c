@@ -110,12 +110,14 @@ static struct ev_signal sigterm_watcher;
 static struct ev_signal sigchld_watcher;
 static struct ev_signal sigusr1_watcher;
 #else
+#ifndef LIB_ONLY
 static struct plugin_watcher_t {
     ev_io io;
     SOCKET fd;
     uint16_t port;
     int valid;
 } plugin_watcher;
+#endif
 #endif
 
 #ifdef HAVE_SETRLIMIT
@@ -824,6 +826,20 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             // Not bypass
             if (remote == NULL) {
                 remote = create_remote(server->listener, NULL);
+
+                if (sni_detected) {
+                    // Reconstruct address buffer
+                    abuf->len               = 0;
+                    abuf->data[abuf->len++] = 3;
+                    abuf->data[abuf->len++] = ret;
+                    memcpy(abuf->data + abuf->len, hostname, ret);
+                    abuf->len += ret;
+                    dst_port  = htons(dst_port);
+                    memcpy(abuf->data + abuf->len, &dst_port, 2);
+                    abuf->len += 2;
+
+                    ss_free(hostname);
+                }
             }
 
             if (remote == NULL) {
@@ -1323,7 +1339,9 @@ signal_cb(EV_P_ ev_signal *w, int revents)
             ev_signal_stop(EV_DEFAULT, &sigchld_watcher);
             ev_signal_stop(EV_DEFAULT, &sigusr1_watcher);
 #else
+#ifndef LIB_ONLY
             ev_io_stop(EV_DEFAULT, &plugin_watcher.io);
+#endif
 #endif
             keep_resolving = 0;
             ev_unloop(EV_A_ EVUNLOOP_ALL);
@@ -1890,6 +1908,10 @@ main(int argc, char **argv)
     }
 
 #ifdef __MINGW32__
+    if (plugin_watcher.valid) {
+        closesocket(plugin_watcher.fd);
+    }
+
     winsock_cleanup();
 #endif
 
@@ -2039,10 +2061,6 @@ _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udat
     }
 
 #ifdef __MINGW32__
-    if (plugin_watcher.valid) {
-        closesocket(plugin_watcher.fd);
-    }
-
     winsock_cleanup();
 #endif
 
