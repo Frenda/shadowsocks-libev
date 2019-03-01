@@ -947,8 +947,7 @@ main(int argc, char **argv)
             break;
         case 's':
             if (remote_num < MAX_REMOTE_NUM) {
-                remote_addr[remote_num].host   = optarg;
-                remote_addr[remote_num++].port = NULL;
+                parse_addr(optarg, &remote_addr[remote_num++]);
             }
             break;
         case 'p':
@@ -1115,7 +1114,11 @@ main(int argc, char **argv)
             FATAL("failed to find a free port");
         }
         snprintf(tmp_port, 8, "%d", port);
-        plugin_host = "127.0.0.1";
+        if (is_ipv6only(remote_addr, remote_num)) {
+            plugin_host = "::1";
+        } else {
+            plugin_host = "127.0.0.1";
+        }
         plugin_port = tmp_port;
 
 #ifdef __MINGW32__

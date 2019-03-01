@@ -25,6 +25,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "netutils.h"
 #include "utils.h"
 #include "jconf.h"
 #include "json.h"
@@ -211,8 +212,7 @@ read_jconf(const char *file)
                         conf.remote_num = j + 1;
                     }
                 } else if (value->type == json_string) {
-                    conf.remote_addr[0].host = to_string(value);
-                    conf.remote_addr[0].port = NULL;
+                    parse_addr(to_string(value), conf.remote_addr);
                     conf.remote_num          = 1;
                 }
             } else if (strcmp(name, "port_password") == 0) {
