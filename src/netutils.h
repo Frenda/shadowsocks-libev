@@ -1,7 +1,7 @@
 /*
  * netutils.h - Network utilities
  *
- * Copyright (C) 2013 - 2018, Max Lv <max.c.lv@gmail.com>
+ * Copyright (C) 2013 - 2019, Max Lv <max.c.lv@gmail.com>
  *
  * This file is part of the shadowsocks-libev.
  *
@@ -51,6 +51,9 @@
 #undef TCP_FASTOPEN_CONNECT
 #endif
 #endif
+
+#define MAX_HOSTNAME_LEN 256 // FQCN <= 255 characters
+#define MAX_PORT_STR_LEN 6   // PORT < 65536
 
 typedef struct {
     char *host;
@@ -108,6 +111,6 @@ int sockaddr_cmp_addr(struct sockaddr_storage *addr1,
 
 int validate_hostname(const char *hostname, const int hostname_len);
 
-int is_ipv6only(ss_addr_t *servers, size_t server_num);
+int is_ipv6only(ss_addr_t *servers, size_t server_num, int ipv6first);
 
 #endif

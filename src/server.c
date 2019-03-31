@@ -1,7 +1,7 @@
 /*
  * server.c - Provide shadowsocks service
  *
- * Copyright (C) 2013 - 2018, Max Lv <max.c.lv@gmail.com>
+ * Copyright (C) 2013 - 2019, Max Lv <max.c.lv@gmail.com>
  *
  * This file is part of the shadowsocks-libev.
  *
@@ -966,7 +966,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             memset(query, 0, sizeof(query_t));
             query->server = server;
             server->query = query;
-            snprintf(query->hostname, 257, "%s", host);
+            snprintf(query->hostname, MAX_HOSTNAME_LEN, "%s", host);
 
             server->stage = STAGE_RESOLVE;
             resolv_start(host, port, resolv_cb, resolv_free_cb, query);
@@ -1610,11 +1610,11 @@ main(int argc, char **argv)
     char *plugin_host = NULL;
     char *plugin_port = NULL;
     char tmp_port[8];
+    char *nameservers = NULL;
 
     int server_num = 0;
     ss_addr_t server_addr[MAX_REMOTE_NUM];
-
-    char *nameservers = NULL;
+    memset(server_addr, 0, sizeof(ss_addr_t) * MAX_REMOTE_NUM);
 
     static struct option long_options[] = {
         { "fast-open",       no_argument,       NULL, GETOPT_VAL_FAST_OPEN   },
@@ -1835,7 +1835,7 @@ main(int argc, char **argv)
         exit(EXIT_FAILURE);
     }
 
-    if (is_ipv6only(server_addr, server_num)) {
+    if (is_ipv6only(server_addr, server_num, ipv6first)) {
         plugin_host = "::1";
     } else {
         plugin_host = "127.0.0.1";
