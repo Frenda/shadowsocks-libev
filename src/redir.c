@@ -800,10 +800,12 @@ accept_cb(EV_P_ ev_io *w, int revents)
         if (rc < 0 && errno != ENOPROTOOPT) {
             LOGE("setting ipv4 dscp failed: %d", errno);
         }
+#ifdef IPV6_TCLASS
         rc = setsockopt(remotefd, IPPROTO_IPV6, IPV6_TCLASS, &listener->tos, sizeof(listener->tos));
         if (rc < 0 && errno != ENOPROTOOPT) {
             LOGE("setting ipv6 dscp failed: %d", errno);
         }
+#endif
     }
 
     // Enable MPTCP
@@ -1378,6 +1380,10 @@ main(int argc, char **argv)
     if (plugin != NULL) {
         stop_plugin();
     }
+
+    for (i = 0; i < remote_num; i++)
+        ss_free(listen_ctx.remote_addr[i]);
+    ss_free(listen_ctx.remote_addr);
 
     return ret_val;
 }
