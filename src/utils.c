@@ -414,6 +414,12 @@ usage()
 #ifdef __linux__
     printf(
         "       [--mptcp]                  Enable Multipath TCP on MPTCP Kernel.\n");
+#ifdef USE_NFTABLES
+    printf(
+        "       [--nftables-sets <sets>]   Add malicious IP into nftables sets.\n");
+    printf(
+        "                                  sets spec: [<table1>:]<set1>[,[<table2>:]<set2>...]\n");
+#endif
 #endif
 #ifndef MODULE_MANAGER
     printf(
@@ -478,7 +484,7 @@ daemonize(const char *path)
     }
 
     int dev_null = open("/dev/null", O_WRONLY);
-    if (dev_null) {
+    if (dev_null > 0) {
         /* Redirect to null device  */
         dup2(dev_null, STDOUT_FILENO);
         dup2(dev_null, STDERR_FILENO);
