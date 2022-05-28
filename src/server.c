@@ -550,7 +550,7 @@ create_and_bind(const char *host, const char *port, int mptcp)
 {
     struct addrinfo hints;
     struct addrinfo *result, *rp, *ipv4v6bindall;
-    int s, listen_sock;
+    int s, listen_sock = -1;
 
     memset(&hints, 0, sizeof(struct addrinfo));
     hints.ai_family   = AF_UNSPEC;               /* Return IPv4 and IPv6 choices */
@@ -594,7 +594,13 @@ create_and_bind(const char *host, const char *port, int mptcp)
     }
 
     for (/*rp = result*/; rp != NULL; rp = rp->ai_next) {
-        listen_sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        int protocol = rp->ai_protocol;
+#ifdef IPPROTO_MPTCP
+        if (mptcp == 1) {
+            protocol = IPPROTO_MPTCP;
+        }
+#endif
+        listen_sock = socket(rp->ai_family, rp->ai_socktype, protocol);
         if (listen_sock == -1) {
             continue;
         }
@@ -616,6 +622,7 @@ create_and_bind(const char *host, const char *port, int mptcp)
             }
         }
 
+#ifndef IPPROTO_MPTCP
         if (mptcp == 1) {
             int i = 0;
             while ((mptcp = mptcp_enabled_values[i]) > 0) {
@@ -629,6 +636,7 @@ create_and_bind(const char *host, const char *port, int mptcp)
                 ERROR("failed to enable multipath TCP");
             }
         }
+#endif
 
         s = bind(listen_sock, rp->ai_addr, rp->ai_addrlen);
         if (s == 0) {
